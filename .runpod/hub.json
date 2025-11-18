@@ -1,0 +1,8 @@
+   {
+     "env": [
+       { "key": "MODEL_NAME", "value": "nvidia/llama-embed-nemotron-8b" },
+       { "key": "HF_TOKEN", "value": "" }
+     ],
+     "gpu": "NVIDIA-A10G",
+     "containerDisk": "40GB"
+   }
