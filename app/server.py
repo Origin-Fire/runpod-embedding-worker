@@ -1,6 +1,6 @@
 import os
 from typing import List, Union
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Response
 from pydantic import BaseModel
 from sentence_transformers import SentenceTransformer
 import uvicorn
@@ -10,19 +10,14 @@ MODEL_NAME = os.getenv("MODEL_NAME", "nvidia/llama-embed-nemotron-8b")
 HF_TOKEN = os.getenv("HF_TOKEN")
 NORMALIZE_EMBEDDINGS = os.getenv("NORMALIZE_EMBEDDINGS", "true").lower() == "true"
 EMBED_BATCH_SIZE = int(os.getenv("EMBED_BATCH_SIZE", "16"))
-
-# Load the model at startup
-print(f"Loading model: {MODEL_NAME}")
-model = SentenceTransformer(
-    MODEL_NAME,
-    trust_remote_code=True,
-    token=HF_TOKEN,
-)
-model.max_seq_length = getattr(model, "max_seq_length", 8192)
-print(f"Model loaded successfully. Max sequence length: {model.max_seq_length}")
+PORT = int(os.getenv("PORT", "80"))
 
 # Create FastAPI app
 app = FastAPI(title="RunPod Embedding Worker")
+
+# Global state for model loading
+model = None
+model_loading = True
 
 
 # Request/Response models for OpenAI compatibility
@@ -55,14 +50,45 @@ class ModelListResponse(BaseModel):
     data: List[ModelInfo]
 
 
+@app.on_event("startup")
+async def load_model():
+    """Load the model during application startup"""
+    global model, model_loading
+    print(f"Loading model: {MODEL_NAME}")
+    try:
+        model = SentenceTransformer(
+            MODEL_NAME,
+            trust_remote_code=True,
+            token=HF_TOKEN,
+        )
+        model.max_seq_length = getattr(model, "max_seq_length", 8192)
+        print(f"Model loaded successfully. Max sequence length: {model.max_seq_length}")
+        model_loading = False
+    except Exception as e:
+        print(f"Error loading model: {e}")
+        raise
+
+
+@app.get("/ping")
+async def health_check(response: Response):
+    """
+    Required health check endpoint for RunPod load balancing.
+    Returns 204 while initializing, 200 when ready, 503 on error.
+    """
+    if model_loading:
+        response.status_code = 204  # Initializing
+        return {"status": "initializing"}
+    elif model is None:
+        response.status_code = 503  # Service unavailable
+        return {"status": "error", "message": "Model failed to load"}
+    else:
+        response.status_code = 200  # Healthy
+        return {"status": "healthy", "model": MODEL_NAME}
+
+
 @app.get("/")
 async def root():
-    return {"status": "healthy", "model": MODEL_NAME}
-
-
-@app.get("/health")
-async def health():
-    return {"status": "healthy"}
+    return {"status": "healthy" if not model_loading else "initializing", "model": MODEL_NAME}
 
 
 @app.get("/v1/models")
@@ -84,6 +110,9 @@ async def list_models():
 @app.post("/v1/embeddings")
 async def create_embeddings(request: EmbeddingRequest):
     """OpenAI-compatible embeddings endpoint"""
+    if model is None:
+        raise HTTPException(status_code=503, detail="Model not loaded yet")
+    
     try:
         # Handle both string and list inputs
         texts = [request.input] if isinstance(request.input, str) else request.input
@@ -120,5 +149,5 @@ async def create_embeddings(request: EmbeddingRequest):
 
 
 if __name__ == "__main__":
-    # RunPod load balancer expects the server to listen on port 8000
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    # Use PORT environment variable (RunPod load balancing standard)
+    uvicorn.run(app, host="0.0.0.0", port=PORT)
