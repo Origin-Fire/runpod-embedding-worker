@@ -1,5 +1,6 @@
 import os
 from typing import List, Union
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Response
 from pydantic import BaseModel
 from sentence_transformers import SentenceTransformer
@@ -8,16 +9,67 @@ import uvicorn
 # Configuration from environment variables
 MODEL_NAME = os.getenv("MODEL_NAME", "nvidia/llama-embed-nemotron-8b")
 HF_TOKEN = os.getenv("HF_TOKEN")
-NORMALIZE_EMBEDDINGS = os.getenv("NORMALIZE_EMBEDDINGS", "true").lower() == "true"
+NORMALIZE_EMBEDDINGS = os.getenv("NORMALIZE_EMBEDINGS", "true").lower() == "true"
 EMBED_BATCH_SIZE = int(os.getenv("EMBED_BATCH_SIZE", "16"))
 PORT = int(os.getenv("PORT", "80"))
-
-# Create FastAPI app
-app = FastAPI(title="RunPod Embedding Worker")
 
 # Global state for model loading
 model = None
 model_loading = True
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Lifespan context manager for startup and shutdown events"""
+    global model, model_loading
+    
+    # Startup: Load the model
+    print(f"Loading model: {MODEL_NAME}")
+    try:
+        import torch
+        
+        # Check GPU availability
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        print(f"Using device: {device}")
+        
+        if device == "cuda":
+            print(f"GPU: {torch.cuda.get_device_name(0)}")
+            print(f"GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB")
+        
+        # Check for torch dtype override
+        torch_dtype = os.getenv("TORCH_DTYPE", "float16")
+        model_kwargs = {}
+        
+        if device == "cuda":
+            if torch_dtype == "float16":
+                model_kwargs["torch_dtype"] = torch.float16
+                print("Loading model in float16 precision to save GPU memory")
+            elif torch_dtype == "bfloat16":
+                model_kwargs["torch_dtype"] = torch.bfloat16
+                print("Loading model in bfloat16 precision to save GPU memory")
+        
+        model = SentenceTransformer(
+            MODEL_NAME,
+            trust_remote_code=True,
+            token=HF_TOKEN,
+            device=device,
+            model_kwargs=model_kwargs if model_kwargs else None,
+        )
+        model.max_seq_length = getattr(model, "max_seq_length", 8192)
+        print(f"Model loaded successfully on {device}. Max sequence length: {model.max_seq_length}")
+        model_loading = False
+    except Exception as e:
+        print(f"Error loading model: {e}")
+        raise
+    
+    yield
+    
+    # Shutdown: Cleanup (optional)
+    print("Shutting down...")
+
+
+# Create FastAPI app with lifespan handler
+app = FastAPI(title="RunPod Embedding Worker", lifespan=lifespan)
 
 
 # Request/Response models for OpenAI compatibility
@@ -50,23 +102,6 @@ class ModelListResponse(BaseModel):
     data: List[ModelInfo]
 
 
-@app.on_event("startup")
-async def load_model():
-    """Load the model during application startup"""
-    global model, model_loading
-    print(f"Loading model: {MODEL_NAME}")
-    try:
-        model = SentenceTransformer(
-            MODEL_NAME,
-            trust_remote_code=True,
-            token=HF_TOKEN,
-        )
-        model.max_seq_length = getattr(model, "max_seq_length", 8192)
-        print(f"Model loaded successfully. Max sequence length: {model.max_seq_length}")
-        model_loading = False
-    except Exception as e:
-        print(f"Error loading model: {e}")
-        raise
 
 
 @app.get("/ping")
